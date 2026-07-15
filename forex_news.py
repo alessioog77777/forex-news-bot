@@ -26,10 +26,11 @@ SWISS_TIMEZONE = ZoneInfo("Europe/Zurich")
 REQUEST_TIMEOUT = 30
 
 STATE_DIRECTORY = Path(".bot-state")
-STATE_FILE = STATE_DIRECTORY / "last_message.json"
+STATE_FILE = STATE_DIRECTORY / "messages.json"
 
 
 def clean_value(value: Any) -> str:
+    """Convert empty calendar values into a dash."""
     if value is None:
         return "–"
 
@@ -37,7 +38,9 @@ def clean_value(value: Any) -> str:
     return text if text else "–"
 
 
-def get_forex_events() -> list[dict[str, Any]]:
+def download_forex_calendar() -> list[dict[str, Any]]:
+    """Download the weekly economic calendar."""
+
     response = requests.get(
         FOREX_FACTORY_URL,
         timeout=REQUEST_TIMEOUT,
@@ -63,6 +66,8 @@ def get_forex_events() -> list[dict[str, Any]]:
 def parse_event_datetime(
     date_value: str,
 ) -> datetime | None:
+    """Convert an event time to Swiss local time."""
+
     if not date_value or date_value == "–":
         return None
 
@@ -82,21 +87,24 @@ def parse_event_datetime(
 
 
 def get_today_events() -> list[dict[str, str]]:
+    """Get today's high-impact USD events."""
+
     today = datetime.now(SWISS_TIMEZONE).date()
-    calendar_events = get_forex_events()
+    calendar_events = download_forex_calendar()
 
     filtered_events: list[dict[str, str]] = []
 
     for event in calendar_events:
-        country = clean_value(
+        currency = clean_value(
             event.get("country")
+            or event.get("currency")
         ).upper()
 
         impact = clean_value(
             event.get("impact")
         ).lower()
 
-        if country != "USD":
+        if currency != "USD":
             continue
 
         if impact != "high":
@@ -114,21 +122,15 @@ def get_today_events() -> list[dict[str, str]]:
 
         filtered_events.append(
             {
-                "time": event_datetime.strftime(
-                    "%H:%M"
-                ),
-                "title": clean_value(
-                    event.get("title")
-                ),
+                "time": event_datetime.strftime("%H:%M"),
+                "title": clean_value(event.get("title")),
                 "forecast": clean_value(
                     event.get("forecast")
                 ),
                 "previous": clean_value(
                     event.get("previous")
                 ),
-                "sort_key": (
-                    event_datetime.isoformat()
-                ),
+                "sort_key": event_datetime.isoformat(),
             }
         )
 
@@ -142,6 +144,8 @@ def get_today_events() -> list[dict[str, str]]:
 def build_event_line(
     event: dict[str, str],
 ) -> str:
+    """Build one Discord calendar line."""
+
     return (
         f"🔴 **{event['time']} Swiss time** — "
         f"{event['title']} · "
@@ -153,6 +157,8 @@ def build_event_line(
 def build_payload(
     events: list[dict[str, str]],
 ) -> dict[str, Any]:
+    """Build the Discord webhook message."""
+
     now = datetime.now(SWISS_TIMEZONE)
 
     date_text = now.strftime(
@@ -165,12 +171,12 @@ def build_payload(
             for event in events
         )
 
-        footer = (
+        footer_text = (
             "Today's USD high-impact events · "
             "Swiss time · Forex Factory"
         )
 
-        color = 0xED4245
+        embed_color = 0xED4245
 
     else:
         description = (
@@ -178,12 +184,12 @@ def build_payload(
             "Have a great day!"
         )
 
-        footer = (
+        footer_text = (
             "USD high-impact events only · "
             "Swiss time · Forex Factory"
         )
 
-        color = 0x5865F2
+        embed_color = 0x5865F2
 
     return {
         "username": "Economic Calendar",
@@ -202,18 +208,20 @@ def build_payload(
                     "calendar"
                 ),
                 "description": description,
-                "color": color,
+                "color": embed_color,
                 "footer": {
-                    "text": footer
+                    "text": footer_text
                 },
             }
         ],
     }
 
 
-def load_last_message_id() -> str | None:
+def load_old_message_ids() -> list[str]:
+    """Load all previously saved Discord message IDs."""
+
     if not STATE_FILE.exists():
-        return None
+        return []
 
     try:
         data = json.loads(
@@ -222,23 +230,30 @@ def load_last_message_id() -> str | None:
             )
         )
 
-        message_id = str(
-            data.get("message_id", "")
-        ).strip()
+        message_ids = data.get("message_ids", [])
 
-        return message_id or None
+        if not isinstance(message_ids, list):
+            return []
+
+        return [
+            str(message_id).strip()
+            for message_id in message_ids
+            if str(message_id).strip()
+        ]
 
     except (
         OSError,
         json.JSONDecodeError,
         AttributeError,
     ):
-        return None
+        return []
 
 
-def save_last_message_id(
+def save_message_id(
     message_id: str,
 ) -> None:
+    """Save the current Discord message ID."""
+
     STATE_DIRECTORY.mkdir(
         parents=True,
         exist_ok=True,
@@ -247,16 +262,19 @@ def save_last_message_id(
     STATE_FILE.write_text(
         json.dumps(
             {
-                "message_id": message_id
-            }
+                "message_ids": [message_id]
+            },
+            indent=2,
         ),
         encoding="utf-8",
     )
 
 
-def delete_old_message(
+def delete_discord_message(
     message_id: str,
-) -> None:
+) -> bool:
+    """Delete one previously posted webhook message."""
+
     delete_url = (
         f"{DISCORD_WEBHOOK_URL}"
         f"/messages/{message_id}"
@@ -267,24 +285,58 @@ def delete_old_message(
         timeout=REQUEST_TIMEOUT,
     )
 
-    if response.status_code in {
-        200,
-        204,
-        404,
-    }:
-        return
+    if response.status_code in {200, 204}:
+        return True
+
+    if response.status_code == 404:
+        return False
 
     response.raise_for_status()
+    return False
+
+
+def delete_old_messages() -> None:
+    """Delete all webhook messages known to the bot."""
+
+    message_ids = load_old_message_ids()
+
+    if not message_ids:
+        print("No saved old messages were found.")
+        return
+
+    for message_id in message_ids:
+        try:
+            deleted = delete_discord_message(
+                message_id
+            )
+
+            if deleted:
+                print(
+                    "Deleted previous Discord message: "
+                    f"{message_id}"
+                )
+            else:
+                print(
+                    "Previous message was already deleted: "
+                    f"{message_id}"
+                )
+
+        except requests.RequestException as error:
+            print(
+                "Could not delete previous message "
+                f"{message_id}: {error}",
+                file=sys.stderr,
+            )
 
 
 def send_new_message(
     payload: dict[str, Any],
 ) -> str:
+    """Send the current calendar and return its message ID."""
+
     response = requests.post(
         DISCORD_WEBHOOK_URL,
-        params={
-            "wait": "true"
-        },
+        params={"wait": "true"},
         json=payload,
         timeout=REQUEST_TIMEOUT,
     )
@@ -292,6 +344,7 @@ def send_new_message(
     response.raise_for_status()
 
     response_data = response.json()
+
     message_id = str(
         response_data.get("id", "")
     ).strip()
@@ -307,8 +360,7 @@ def send_new_message(
 def main() -> None:
     if not DISCORD_WEBHOOK_URL:
         print(
-            "Error: DISCORD_WEBHOOK_URL "
-            "is missing.",
+            "Error: DISCORD_WEBHOOK_URL is missing.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -317,32 +369,18 @@ def main() -> None:
         events = get_today_events()
         payload = build_payload(events)
 
-        old_message_id = (
-            load_last_message_id()
-        )
+        # First remove the previously stored message.
+        delete_old_messages()
 
-        if old_message_id:
-            delete_old_message(
-                old_message_id
-            )
+        # Then send the new daily message.
+        new_message_id = send_new_message(payload)
 
-            print(
-                "Previous Discord message "
-                "was deleted."
-            )
-
-        new_message_id = send_new_message(
-            payload
-        )
-
-        save_last_message_id(
-            new_message_id
-        )
+        # Save its ID for the next workflow run.
+        save_message_id(new_message_id)
 
         print(
-            f"Successfully posted "
-            f"{len(events)} high-impact "
-            f"USD event(s)."
+            f"Successfully posted {len(events)} "
+            "high-impact USD event(s)."
         )
 
     except requests.RequestException as error:
