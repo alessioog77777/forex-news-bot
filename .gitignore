@@ -1,0 +1,5 @@
+.env
+.bot-state/
+.warning-state/
+__pycache__/
+*.pyc
