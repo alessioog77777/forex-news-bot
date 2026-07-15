@@ -1,1 +1,32 @@
+name: Daily USD Forex News
 
+on:
+  schedule:
+    - cron: "1 0 * * *"
+      timezone: "Europe/Zurich"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  post-news:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python forex_news.py
