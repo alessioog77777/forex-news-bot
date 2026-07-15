@@ -1,7 +1,9 @@
+import json
 import os
 import sys
-import xml.etree.ElementTree as ET
 from datetime import datetime
+from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import requests
@@ -10,127 +12,98 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+DISCORD_WEBHOOK_URL = os.getenv(
+    "DISCORD_WEBHOOK_URL",
+    "",
+).strip()
 
-FOREX_FACTORY_FEED = (
-    "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+FOREX_FACTORY_URL = (
+    "https://nfs.faireconomy.media/"
+    "ff_calendar_thisweek.json"
 )
 
-FOREX_FACTORY_TIMEZONE = ZoneInfo("America/New_York")
 SWISS_TIMEZONE = ZoneInfo("Europe/Zurich")
+REQUEST_TIMEOUT = 30
+
+STATE_DIRECTORY = Path(".bot-state")
+STATE_FILE = STATE_DIRECTORY / "last_message.json"
 
 
-def get_text(event, tag: str, default: str = "–") -> str:
-    element = event.find(tag)
+def clean_value(value: Any) -> str:
+    if value is None:
+        return "–"
 
-    if element is None or element.text is None:
-        return default
-
-    value = element.text.strip()
-    return value or default
+    text = str(value).strip()
+    return text if text else "–"
 
 
-def parse_event_datetime(date_text: str, time_text: str):
-    date_formats = (
-        "%m-%d-%Y",
-        "%m/%d/%Y",
-        "%Y-%m-%d",
-    )
-
-    time_formats = (
-        "%I:%M%p",
-        "%I%p",
-        "%H:%M",
-    )
-
-    event_date = None
-
-    for date_format in date_formats:
-        try:
-            event_date = datetime.strptime(
-                date_text.strip(),
-                date_format,
-            ).date()
-            break
-        except ValueError:
-            continue
-
-    if event_date is None:
-        return None
-
-    normalized_time = (
-        time_text.strip()
-        .replace(" ", "")
-        .upper()
-    )
-
-    if normalized_time in {
-        "",
-        "ALLDAY",
-        "TENTATIVE",
-        "TENTATIVE.",
-    }:
-        return None
-
-    for time_format in time_formats:
-        try:
-            event_time = datetime.strptime(
-                normalized_time,
-                time_format,
-            ).time()
-
-            new_york_datetime = datetime.combine(
-                event_date,
-                event_time,
-                tzinfo=FOREX_FACTORY_TIMEZONE,
-            )
-
-            return new_york_datetime.astimezone(
-                SWISS_TIMEZONE
-            )
-
-        except ValueError:
-            continue
-
-    return None
-
-
-def load_high_impact_usd_events():
+def get_forex_events() -> list[dict[str, Any]]:
     response = requests.get(
-        FOREX_FACTORY_FEED,
-        timeout=30,
+        FOREX_FACTORY_URL,
+        timeout=REQUEST_TIMEOUT,
         headers={
             "User-Agent": (
                 "Mozilla/5.0 "
-                "USD-News-Discord-Webhook/1.0"
+                "Forex-News-Discord-Bot/1.0"
             )
         },
     )
+
     response.raise_for_status()
+    data = response.json()
 
-    root = ET.fromstring(response.content)
-    today = datetime.now(SWISS_TIMEZONE).date()
-
-    events = []
-
-    for event in root.findall(".//event"):
-        country = get_text(event, "country", "")
-        currency = get_text(event, "currency", "")
-        impact = get_text(event, "impact", "")
-
-        is_usd = (
-            country.upper() == "USD"
-            or currency.upper() == "USD"
+    if not isinstance(data, list):
+        raise ValueError(
+            "Forex Factory returned unexpected data."
         )
 
-        is_high_impact = impact.lower() == "high"
+    return data
 
-        if not is_usd or not is_high_impact:
+
+def parse_event_datetime(
+    date_value: str,
+) -> datetime | None:
+    if not date_value or date_value == "–":
+        return None
+
+    try:
+        event_datetime = datetime.fromisoformat(
+            date_value.replace("Z", "+00:00")
+        )
+    except ValueError:
+        return None
+
+    if event_datetime.tzinfo is None:
+        return None
+
+    return event_datetime.astimezone(
+        SWISS_TIMEZONE
+    )
+
+
+def get_today_events() -> list[dict[str, str]]:
+    today = datetime.now(SWISS_TIMEZONE).date()
+    calendar_events = get_forex_events()
+
+    filtered_events: list[dict[str, str]] = []
+
+    for event in calendar_events:
+        country = clean_value(
+            event.get("country")
+        ).upper()
+
+        impact = clean_value(
+            event.get("impact")
+        ).lower()
+
+        if country != "USD":
+            continue
+
+        if impact != "high":
             continue
 
         event_datetime = parse_event_datetime(
-            get_text(event, "date", ""),
-            get_text(event, "time", ""),
+            clean_value(event.get("date"))
         )
 
         if event_datetime is None:
@@ -139,118 +112,237 @@ def load_high_impact_usd_events():
         if event_datetime.date() != today:
             continue
 
-        events.append(
+        filtered_events.append(
             {
-                "datetime": event_datetime,
-                "title": get_text(event, "title"),
-                "forecast": get_text(event, "forecast"),
-                "previous": get_text(event, "previous"),
+                "time": event_datetime.strftime(
+                    "%H:%M"
+                ),
+                "title": clean_value(
+                    event.get("title")
+                ),
+                "forecast": clean_value(
+                    event.get("forecast")
+                ),
+                "previous": clean_value(
+                    event.get("previous")
+                ),
+                "sort_key": (
+                    event_datetime.isoformat()
+                ),
             }
         )
 
-    events.sort(key=lambda item: item["datetime"])
+    filtered_events.sort(
+        key=lambda item: item["sort_key"]
+    )
 
-    return events
-
-
-def create_description(events):
-    lines = []
-
-    for event in events:
-        time_text = event["datetime"].strftime("%H:%M")
-
-        line = (
-            f"🔴 **{time_text} Swiss time** — "
-            f"{event['title']} · "
-            f"F: {event['forecast']} · "
-            f"P: {event['previous']}"
-        )
-
-        lines.append(line)
-
-    return "\n".join(lines)
+    return filtered_events
 
 
-def send_discord_message(events):
+def build_event_line(
+    event: dict[str, str],
+) -> str:
+    return (
+        f"🔴 **{event['time']} Swiss time** — "
+        f"{event['title']} · "
+        f"F: {event['forecast']} · "
+        f"P: {event['previous']}"
+    )
+
+
+def build_payload(
+    events: list[dict[str, str]],
+) -> dict[str, Any]:
     now = datetime.now(SWISS_TIMEZONE)
 
-    date_title = now.strftime("%A, %B %d")
-    date_title = date_title.replace(" 0", " ")
+    date_text = now.strftime(
+        "%A, %B %d"
+    ).replace(" 0", " ")
 
-    if not events:
-        payload = {
-            "username": "Economic Calendar",
-            "content": "@everyone",
-            "embeds": [
-                {
-                    "title": (
-                        f"📅 Economic Calendar — {date_title}"
-                    ),
-                    "description": (
-                        "No high-impact USD news today. "
-                        "Have a great day!"
-                    ),
-                    "color": 0x5865F2,
-                    "footer": {
-                        "text": (
-                            "USD high-impact events only · "
-                            "Swiss time · Forex Factory"
-                        )
-                    },
-                }
-            ],
-            "allowed_mentions": {
-                "parse": ["everyone"]
-            },
-        }
+    if events:
+        description = "\n".join(
+            build_event_line(event)
+            for event in events
+        )
+
+        footer = (
+            "Today's USD high-impact events · "
+            "Swiss time · Forex Factory"
+        )
+
+        color = 0xED4245
 
     else:
-        payload = {
-            "username": "Economic Calendar",
-            "content": "@everyone",
-            "embeds": [
-                {
-                    "title": (
-                        f"📅 Economic Calendar — {date_title}"
-                    ),
-                    "description": create_description(events),
-                    "color": 0xED4245,
-                    "footer": {
-                        "text": (
-                            "Today's USD high-impact events · "
-                            "Swiss time · Forex Factory"
-                        )
-                    },
-                }
-            ],
-            "allowed_mentions": {
-                "parse": ["everyone"]
-            },
-        }
+        description = (
+            "No high-impact USD news today. "
+            "Have a great day!"
+        )
 
-    response = requests.post(
-        WEBHOOK_URL,
-        json=payload,
-        timeout=30,
+        footer = (
+            "USD high-impact events only · "
+            "Swiss time · Forex Factory"
+        )
+
+        color = 0x5865F2
+
+    return {
+        "username": "Economic Calendar",
+        "content": "@everyone",
+        "allowed_mentions": {
+            "parse": ["everyone"]
+        },
+        "embeds": [
+            {
+                "title": (
+                    f"📅 Economic Calendar — "
+                    f"{date_text}"
+                ),
+                "url": (
+                    "https://www.forexfactory.com/"
+                    "calendar"
+                ),
+                "description": description,
+                "color": color,
+                "footer": {
+                    "text": footer
+                },
+            }
+        ],
+    }
+
+
+def load_last_message_id() -> str | None:
+    if not STATE_FILE.exists():
+        return None
+
+    try:
+        data = json.loads(
+            STATE_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        message_id = str(
+            data.get("message_id", "")
+        ).strip()
+
+        return message_id or None
+
+    except (
+        OSError,
+        json.JSONDecodeError,
+        AttributeError,
+    ):
+        return None
+
+
+def save_last_message_id(
+    message_id: str,
+) -> None:
+    STATE_DIRECTORY.mkdir(
+        parents=True,
+        exist_ok=True,
     )
+
+    STATE_FILE.write_text(
+        json.dumps(
+            {
+                "message_id": message_id
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def delete_old_message(
+    message_id: str,
+) -> None:
+    delete_url = (
+        f"{DISCORD_WEBHOOK_URL}"
+        f"/messages/{message_id}"
+    )
+
+    response = requests.delete(
+        delete_url,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    if response.status_code in {
+        200,
+        204,
+        404,
+    }:
+        return
 
     response.raise_for_status()
 
 
-def main():
-    if not WEBHOOK_URL:
+def send_new_message(
+    payload: dict[str, Any],
+) -> str:
+    response = requests.post(
+        DISCORD_WEBHOOK_URL,
+        params={
+            "wait": "true"
+        },
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    response_data = response.json()
+    message_id = str(
+        response_data.get("id", "")
+    ).strip()
+
+    if not message_id:
+        raise ValueError(
+            "Discord did not return a message ID."
+        )
+
+    return message_id
+
+
+def main() -> None:
+    if not DISCORD_WEBHOOK_URL:
         print(
-            "DISCORD_WEBHOOK_URL is missing.",
+            "Error: DISCORD_WEBHOOK_URL "
+            "is missing.",
             file=sys.stderr,
         )
         sys.exit(1)
 
     try:
-        events = load_high_impact_usd_events()
-        send_discord_message(events)
+        events = get_today_events()
+        payload = build_payload(events)
+
+        old_message_id = (
+            load_last_message_id()
+        )
+
+        if old_message_id:
+            delete_old_message(
+                old_message_id
+            )
+
+            print(
+                "Previous Discord message "
+                "was deleted."
+            )
+
+        new_message_id = send_new_message(
+            payload
+        )
+
+        save_last_message_id(
+            new_message_id
+        )
 
         print(
-            f"Posted {len(events)} high-impact USD events."
+            f"Successfully posted "
+            f"{len(events)} high-impact "
+            f"USD event(s)."
         )
 
     except requests.RequestException as error:
@@ -260,9 +352,9 @@ def main():
         )
         sys.exit(1)
 
-    except ET.ParseError as error:
+    except ValueError as error:
         print(
-            f"XML error: {error}",
+            f"Data error: {error}",
             file=sys.stderr,
         )
         sys.exit(1)
