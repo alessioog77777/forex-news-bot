@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: daily-forex-news
+  cancel-in-progress: false
+
 jobs:
   post-news:
     runs-on: ubuntu-latest
