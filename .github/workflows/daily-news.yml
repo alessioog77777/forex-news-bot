@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: daily-forex-news
+  group: forex-discord-messages
   cancel-in-progress: false
 
 jobs:
@@ -21,33 +21,52 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
 
-      - name: Restore previous message state
+      - name: Restore daily-message state
         uses: actions/cache/restore@v5
         with:
           path: .bot-state
-          key: discord-message-${{ github.run_id }}-${{ github.run_attempt }}
+          key: >-
+            daily-message-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            discord-message-
+            daily-message-
+
+      - name: Restore warning state
+        uses: actions/cache/restore@v5
+        with:
+          path: .warning-state
+          key: >-
+            usd-warning-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            usd-warning-
 
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
-      - name: Send today's news
+      - name: Delete old posts and send today's news
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python forex_news.py
 
-      - name: Save current message state
+      - name: Save daily-message state
         if: success()
         uses: actions/cache/save@v5
         with:
           path: .bot-state
-          key: discord-message-${{ github.run_id }}-${{ github.run_attempt }}
+          key: >-
+            daily-message-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save cleared warning state
+        if: success()
+        uses: actions/cache/save@v5
+        with:
+          path: .warning-state
+          key: >-
+            usd-warning-${{ github.run_id }}-${{ github.run_attempt }}
