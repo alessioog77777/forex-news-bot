@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import sys
 from datetime import datetime, timedelta
@@ -28,19 +29,13 @@ FOREX_FACTORY_URL = (
 
 SWISS_TIMEZONE = ZoneInfo("Europe/Zurich")
 REQUEST_TIMEOUT = 30
-
-# GitHub Actions stellt diesen Ordner über den Cache wieder her.
-STATE_DIRECTORY = Path(".warning-state")
-STATE_FILE = STATE_DIRECTORY / "sent_warnings.json"
-
-# GitHub prüft alle 5 Minuten.
-# Es wird gewarnt, sobald ein Ereignis höchstens 10 Minuten entfernt ist.
 WARNING_WINDOW_MINUTES = 10
+
+STATE_DIRECTORY = Path(".warning-state")
+STATE_FILE = STATE_DIRECTORY / "warnings.json"
 
 
 def clean_value(value: Any) -> str:
-    """Convert empty values to a readable dash."""
-
     if value is None:
         return "–"
 
@@ -49,15 +44,13 @@ def clean_value(value: Any) -> str:
 
 
 def download_forex_calendar() -> list[dict[str, Any]]:
-    """Download the weekly Forex Factory calendar."""
-
     response = requests.get(
         FOREX_FACTORY_URL,
         timeout=REQUEST_TIMEOUT,
         headers={
             "User-Agent": (
                 "Mozilla/5.0 "
-                "USD-News-Warning-Webhook/1.0"
+                "USD-News-Warning-Webhook/2.0"
             )
         },
     )
@@ -76,8 +69,6 @@ def download_forex_calendar() -> list[dict[str, Any]]:
 def parse_event_datetime(
     date_value: str,
 ) -> datetime | None:
-    """Convert an event datetime to Swiss local time."""
-
     if not date_value or date_value == "–":
         return None
 
@@ -91,15 +82,15 @@ def parse_event_datetime(
     if event_datetime.tzinfo is None:
         return None
 
-    return event_datetime.astimezone(SWISS_TIMEZONE)
+    return event_datetime.astimezone(
+        SWISS_TIMEZONE
+    )
 
 
 def create_event_id(
     event_datetime: datetime,
     title: str,
 ) -> str:
-    """Create a stable identifier for one economic event."""
-
     normalized_title = " ".join(
         title.lower().split()
     )
@@ -110,11 +101,12 @@ def create_event_id(
     )
 
 
-def load_sent_warnings() -> dict[str, str]:
-    """Load warning IDs already sent during previous runs."""
-
+def load_state() -> dict[str, Any]:
     if not STATE_FILE.exists():
-        return {}
+        return {
+            "sent_events": {},
+            "message_ids": [],
+        }
 
     try:
         data = json.loads(
@@ -122,55 +114,39 @@ def load_sent_warnings() -> dict[str, str]:
         )
 
         if not isinstance(data, dict):
-            return {}
+            raise ValueError
+
+        sent_events = data.get("sent_events", {})
+        message_ids = data.get("message_ids", [])
+
+        if not isinstance(sent_events, dict):
+            sent_events = {}
+
+        if not isinstance(message_ids, list):
+            message_ids = []
 
         return {
-            str(event_id): str(sent_at)
-            for event_id, sent_at in data.items()
+            "sent_events": sent_events,
+            "message_ids": [
+                str(message_id).strip()
+                for message_id in message_ids
+                if str(message_id).strip()
+            ],
         }
 
     except (
         OSError,
+        ValueError,
         json.JSONDecodeError,
         AttributeError,
     ):
-        return {}
+        return {
+            "sent_events": {},
+            "message_ids": [],
+        }
 
 
-def remove_old_warning_ids(
-    sent_warnings: dict[str, str],
-) -> dict[str, str]:
-    """Remove state entries older than three days."""
-
-    cutoff = datetime.now(SWISS_TIMEZONE) - timedelta(
-        days=3
-    )
-
-    cleaned: dict[str, str] = {}
-
-    for event_id, sent_at_text in sent_warnings.items():
-        try:
-            sent_at = datetime.fromisoformat(
-                sent_at_text
-            )
-
-            if sent_at.tzinfo is None:
-                continue
-
-            if sent_at >= cutoff:
-                cleaned[event_id] = sent_at_text
-
-        except ValueError:
-            continue
-
-    return cleaned
-
-
-def save_sent_warnings(
-    sent_warnings: dict[str, str],
-) -> None:
-    """Save the IDs of events that have already been announced."""
-
+def save_state(state: dict[str, Any]) -> None:
     STATE_DIRECTORY.mkdir(
         parents=True,
         exist_ok=True,
@@ -178,7 +154,7 @@ def save_sent_warnings(
 
     STATE_FILE.write_text(
         json.dumps(
-            sent_warnings,
+            state,
             indent=2,
             ensure_ascii=False,
         ),
@@ -186,11 +162,34 @@ def save_sent_warnings(
     )
 
 
-def get_upcoming_events() -> list[dict[str, Any]]:
-    """
-    Return high-impact USD events beginning within ten minutes.
-    """
+def clean_old_sent_events(
+    sent_events: dict[str, str],
+) -> dict[str, str]:
+    cutoff = datetime.now(
+        SWISS_TIMEZONE
+    ) - timedelta(days=3)
 
+    cleaned: dict[str, str] = {}
+
+    for event_id, sent_at_text in sent_events.items():
+        try:
+            sent_at = datetime.fromisoformat(
+                str(sent_at_text)
+            )
+
+            if sent_at.tzinfo is None:
+                continue
+
+            if sent_at >= cutoff:
+                cleaned[event_id] = str(sent_at_text)
+
+        except ValueError:
+            continue
+
+    return cleaned
+
+
+def get_upcoming_events() -> list[dict[str, Any]]:
     now = datetime.now(SWISS_TIMEZONE)
     calendar_events = download_forex_calendar()
 
@@ -223,17 +222,19 @@ def get_upcoming_events() -> list[dict[str, Any]]:
             event_datetime - now
         ).total_seconds()
 
-        minutes_until_event = seconds_until_event / 60
-
-        # Vergangene Ereignisse ausschließen.
-        if minutes_until_event <= 0:
+        if seconds_until_event <= 0:
             continue
 
-        # Nur Ereignisse innerhalb der nächsten 10 Minuten.
+        minutes_until_event = (
+            seconds_until_event / 60
+        )
+
         if minutes_until_event > WARNING_WINDOW_MINUTES:
             continue
 
-        title = clean_value(event.get("title"))
+        title = clean_value(
+            event.get("title")
+        )
 
         upcoming_events.append(
             {
@@ -251,7 +252,7 @@ def get_upcoming_events() -> list[dict[str, Any]]:
                 ),
                 "minutes_until": max(
                     1,
-                    round(minutes_until_event),
+                    math.ceil(minutes_until_event),
                 ),
             }
         )
@@ -266,15 +267,24 @@ def get_upcoming_events() -> list[dict[str, Any]]:
 def build_warning_payload(
     event: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build one Discord warning message."""
-
     event_datetime: datetime = event["datetime"]
+    minutes_until = event["minutes_until"]
+
+    if minutes_until == 1:
+        countdown_text = "1 minute"
+    else:
+        countdown_text = f"{minutes_until} minutes"
 
     description_lines = [
+        f"⏳ **Countdown: {countdown_text}**",
+        "",
         (
-            f"🔴 **{event_datetime.strftime('%H:%M')} "
-            f"Swiss time** — {event['title']}"
-        )
+            f"🔴 **{event['title']}**"
+        ),
+        (
+            f"🕒 **{event_datetime.strftime('%H:%M')} "
+            "Swiss time**"
+        ),
     ]
 
     details: list[str] = []
@@ -290,22 +300,25 @@ def build_warning_payload(
         )
 
     if details:
-        description_lines.append(
-            " · ".join(details)
+        description_lines.extend(
+            [
+                "",
+                " · ".join(details),
+            ]
         )
 
     return {
         "username": "Economic Calendar",
         "content": (
-            "@everyone ⚠️ **Attention: High-impact "
-            "USD news in approximately 10 minutes!**"
+            "@everyone 🚨 **HIGH-IMPACT USD NEWS "
+            f"IN {countdown_text.upper()}!**"
         ),
         "allowed_mentions": {
             "parse": ["everyone"]
         },
         "embeds": [
             {
-                "title": "🚨 USD News Warning",
+                "title": "⚠️ USD News Alert",
                 "url": (
                     "https://www.forexfactory.com/"
                     "calendar"
@@ -316,7 +329,7 @@ def build_warning_payload(
                 "color": 0xED4245,
                 "footer": {
                     "text": (
-                        "High-impact USD event · "
+                        "Expect increased volatility · "
                         "Swiss time · Forex Factory"
                     )
                 },
@@ -326,27 +339,29 @@ def build_warning_payload(
 
 
 def build_test_payload() -> dict[str, Any]:
-    """Build a harmless manual test warning."""
-
-    now = datetime.now(SWISS_TIMEZONE)
-    example_time = now + timedelta(minutes=10)
+    example_time = (
+        datetime.now(SWISS_TIMEZONE)
+        + timedelta(minutes=10)
+    )
 
     return {
         "username": "Economic Calendar",
         "content": (
-            "@everyone ⚠️ **Test: High-impact "
-            "USD news warning!**"
+            "@everyone 🚨 **TEST: HIGH-IMPACT "
+            "USD NEWS IN 10 MINUTES!**"
         ),
         "allowed_mentions": {
             "parse": ["everyone"]
         },
         "embeds": [
             {
-                "title": "🧪 USD Warning Test",
+                "title": "⚠️ USD News Alert",
                 "description": (
-                    f"🔴 **{example_time.strftime('%H:%M')} "
-                    "Swiss time** — Example economic event\n\n"
-                    "This is only a manual test."
+                    "⏳ **Countdown: 10 minutes**\n\n"
+                    "🔴 **Example USD Economic News**\n"
+                    f"🕒 **{example_time.strftime('%H:%M')} "
+                    "Swiss time**\n\n"
+                    "This is only a test message."
                 ),
                 "color": 0xED4245,
                 "footer": {
@@ -359,77 +374,95 @@ def build_test_payload() -> dict[str, Any]:
 
 def send_discord_message(
     payload: dict[str, Any],
-) -> None:
-    """Send a webhook message to Discord."""
-
+) -> str:
     response = requests.post(
         DISCORD_WEBHOOK_URL,
+        params={"wait": "true"},
         json=payload,
         timeout=REQUEST_TIMEOUT,
     )
 
-    if not response.ok:
-        raise requests.HTTPError(
-            (
-                f"Discord returned HTTP "
-                f"{response.status_code}: "
-                f"{response.text}"
-            ),
-            response=response,
+    response.raise_for_status()
+
+    response_data = response.json()
+
+    message_id = str(
+        response_data.get("id", "")
+    ).strip()
+
+    if not message_id:
+        raise ValueError(
+            "Discord did not return a message ID."
         )
+
+    return message_id
 
 
 def run_test() -> None:
-    """Send a manual test message."""
-
-    payload = build_test_payload()
-    send_discord_message(payload)
+    message_id = send_discord_message(
+        build_test_payload()
+    )
 
     print(
-        "The manual warning test was sent successfully."
+        "Test warning sent successfully. "
+        f"Message ID: {message_id}"
     )
 
 
 def run_warning_check() -> None:
-    """Check and announce upcoming USD events."""
+    state = load_state()
 
-    sent_warnings = remove_old_warning_ids(
-        load_sent_warnings()
+    sent_events = clean_old_sent_events(
+        state["sent_events"]
     )
 
+    message_ids = state["message_ids"]
     upcoming_events = get_upcoming_events()
-    newly_sent_count = 0
+
+    sent_count = 0
 
     for event in upcoming_events:
         event_id = event["id"]
 
-        if event_id in sent_warnings:
+        if event_id in sent_events:
             print(
-                "Warning already sent for: "
+                "Warning was already sent for: "
                 f"{event['title']}"
             )
             continue
 
-        payload = build_warning_payload(event)
-        send_discord_message(payload)
-
-        sent_warnings[event_id] = (
-            datetime.now(SWISS_TIMEZONE).isoformat()
+        message_id = send_discord_message(
+            build_warning_payload(event)
         )
 
-        # Direkt nach jeder Nachricht speichern.
-        save_sent_warnings(sent_warnings)
+        sent_events[event_id] = (
+            datetime.now(
+                SWISS_TIMEZONE
+            ).isoformat()
+        )
 
-        newly_sent_count += 1
+        message_ids.append(message_id)
+
+        save_state(
+            {
+                "sent_events": sent_events,
+                "message_ids": message_ids,
+            }
+        )
+
+        sent_count += 1
 
         print(
-            "Warning sent for "
-            f"{event['title']} at "
-            f"{event['datetime'].strftime('%H:%M')}."
+            f"Warning sent for {event['title']} "
+            f"at {event['datetime'].strftime('%H:%M')}."
         )
 
-    # Auch speichern, wenn alte Einträge entfernt wurden.
-    save_sent_warnings(sent_warnings)
+    save_state(
+        {
+            "sent_events": sent_events,
+            "message_ids": message_ids,
+        }
+    )
 
     if not upcoming_events:
         print(
@@ -438,8 +471,7 @@ def run_warning_check() -> None:
         )
 
     print(
-        f"Finished. Sent {newly_sent_count} "
-        "new warning(s)."
+        f"Finished. Sent {sent_count} warning(s)."
     )
 
 
